@@ -74,6 +74,64 @@
 }
 ```
 
+### `POST /trace`
+
+返修工程师按顺序标注一串暗斑中心表示一条裂纹，本接口返回裂纹**依次进入**
+的电池片行列路径。请求体与 `/inspect` 相同，仅把非空 `points` 换成非空
+`vertices`（同一画布、网格、方向，顶点为有序折线）：
+
+```json
+{
+  "width": 600,
+  "height": 400,
+  "rows": 4,
+  "cols": 6,
+  "rotation": 0,
+  "vertices": [{"x": 50, "y": 50}, {"x": 150, "y": 150}]
+}
+```
+
+响应 `200`，含归一化后的 `vertices`（保持输入顺序，含 `index`）与有序
+`path`（每个元素为 `{row, col}`，1 基）：
+
+```json
+{
+  "rotation": 0,
+  "canvas": {"width": 600, "height": 400},
+  "grid": {"rows": 4, "cols": 6},
+  "vertices": [
+    {"index": 0, "x": 50, "y": 50},
+    {"index": 1, "x": 150, "y": 150}
+  ],
+  "path": [{"row": 1, "col": 1}, {"row": 2, "col": 2}]
+}
+```
+
+路径计算与归属规则：
+
+- 每个顶点先用与 `/inspect` 相同的旋转公式逐点归一化；再把折线每一段与
+  非均匀网格线求交。相交参数是精确有理数，**只用整数交叉乘法比较大小**，
+  网格非整除（分界线落在小数像素）时也不依赖任何浮点舍入。
+- 单元区域按**左上闭、右下开**解释，画布最右、最下边缘闭合；线段恰好沿
+  分界线行走时归**右侧 / 下侧**单元。
+- 线段在同一参数处同时穿过一条横向、一条纵向分界线（格网角点）时，直接
+  进入**对角单元**，不会记录只碰到该角点的两个旁侧单元。
+- 连续段交界产生的相同行列只保留一次；离开后再次进入的**非连续重访保留**；
+  重复顶点按零长度线段处理，不产生额外记录；单点折线正常返回其所在单元。
+
+校验与 `/inspect` 一致且为整批语义：任一顶点越界或类型非法（浮点、字符串、
+布尔、缺坐标、非对象元素等）都返回 `422`；**多个顶点同时非法时，按输入
+位置返回全部错误**，每个错误带对应 `index`，响应体不含任何部分结果：
+
+```json
+{
+  "detail": [
+    {"type": "vertex_out_of_bounds", "loc": ["body", "vertices", 0], "msg": "...", "index": 0},
+    {"type": "int_type", "loc": ["body", "vertices", 1, "x"], "msg": "...", "index": 1}
+  ]
+}
+```
+
 另有 `GET /health` 返回 `{"status": "ok"}`，供健康检查使用。
 
 ## 坐标示例（width=600, height=400, rows=4, cols=10）
@@ -123,7 +181,7 @@ curl -s -X POST http://localhost:8000/inspect \
 ```bash
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload          # 服务监听 http://localhost:8000
-pytest                                 # 四种方向 + 分界线 + 整批拒绝的建表测试
+pytest                                 # /inspect 建表测试 + /trace 参考实现/四方向对拍
 python verify.py                       # 对本地已启动的服务做一次性验收
 ```
 
@@ -136,18 +194,20 @@ docker compose up --abort-on-container-exit verify # 一次性验收：verify �
 echo $?                                            # 0 = 验收通过
 ```
 
-`verify` 服务等待 `api` 健康后，对四种旋转方向、分界线归属、顺序保持与
-整批拒绝做真实 HTTP 校验，全部通过则以退出码 0 结束，否则为 1。
+`verify` 服务等待 `api` 健康后，对四种旋转方向、分界线归属、顺序保持、
+整批拒绝以及 `/trace` 的角点穿越、沿线行走、折返重访与四方向等价路径做
+真实 HTTP 校验，全部通过则以退出码 0 结束，否则为 1。
 
 ## 目录结构
 
 ```
 app/
-  main.py        # FastAPI 入口、422 异常处理（携带数组下标）
-  models.py      # 严格校验的请求/响应模型（整批边界校验）
-  transform.py   # 纯整数几何：归一化 + 电池片定位
+  main.py        # FastAPI 入口、422 异常处理（携带数组下标）、/inspect 与 /trace
+  models.py      # 严格校验的请求/响应模型（整批边界校验、vertices 全量聚合）
+  transform.py   # 纯整数几何：归一化 + 电池片定位 + 折线跨格追踪
 tests/
-  test_inspect.py# pytest 建表测试
+  test_inspect.py# /inspect pytest 建表测试
+  test_trace.py  # /trace pytest：独立 Fraction 参考实现 × 四方向随机对拍
 verify.py        # 一次性验收脚本（compose 中的 verify 服务）
 Dockerfile
 docker-compose.yml

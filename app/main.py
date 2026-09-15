@@ -8,32 +8,46 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .models import Canvas, Grid, InspectRequest, InspectResponse, SpotResult
-from .transform import locate_cell, normalize_point, normalized_canvas
+from .models import (
+    Canvas,
+    Grid,
+    InspectRequest,
+    InspectResponse,
+    SpotResult,
+    TraceRequest,
+    TraceResponse,
+    Vertex,
+    CellStep,
+)
+from .transform import locate_cell, normalize_point, normalized_canvas, trace_cells
 
 app = FastAPI(
     title="EL Cell Locator",
     summary="Map dark spots on rotation-normalized EL images to PV module cells.",
-    version="1.0.0",
+    version="1.1.0",
 )
+
+# Request arrays whose element index must be surfaced in 422 error details.
+_INDEXED_FIELDS = ("points", "vertices")
 
 
 def _point_index(error: Dict[str, Any]) -> Optional[int]:
-    """Best-effort extraction of the offending ``points`` array index."""
+    """Best-effort extraction of the offending ``points``/``vertices`` index."""
     ctx = error.get("ctx") or {}
     if isinstance(ctx.get("index"), int):
         return ctx["index"]
     loc = list(error.get("loc") or [])
-    if "points" in loc:
-        pos = loc.index("points")
-        if pos + 1 < len(loc) and isinstance(loc[pos + 1], int):
-            return loc[pos + 1]
+    for field in _INDEXED_FIELDS:
+        if field in loc:
+            pos = loc.index(field)
+            if pos + 1 < len(loc) and isinstance(loc[pos + 1], int):
+                return loc[pos + 1]
     return None
 
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    """422 payload that names the array index of every offending point.
+    """422 payload that names the array index of every offending point/vertex.
 
     The batch is rejected as a whole: the body only contains error details and
     never any partial computation results.
@@ -75,4 +89,28 @@ def inspect(payload: InspectRequest) -> InspectResponse:
         canvas=Canvas(width=canvas_width, height=canvas_height),
         grid=Grid(rows=payload.rows, cols=payload.cols),
         results=results,
+    )
+
+
+@app.post("/trace", response_model=TraceResponse)
+def trace(payload: TraceRequest) -> TraceResponse:
+    """Normalize the crack polyline and return its ordered cell path.
+
+    Each vertex is rotated onto the upright canvas with the same formulas as
+    ``/inspect``; ``path`` is the ordered sequence of 1-based ``(row, col)``
+    cells the crack enters, with consecutive duplicates collapsed. Cells that
+    are revisited after the crack leaves them remain in the sequence.
+    """
+    canvas_width, canvas_height = normalized_canvas(payload.width, payload.height, payload.rotation)
+    normalized = [
+        normalize_point(point.x, point.y, payload.width, payload.height, payload.rotation)
+        for point in payload.vertices
+    ]
+    cells = trace_cells(normalized, canvas_width, canvas_height, payload.rows, payload.cols)
+    return TraceResponse(
+        rotation=payload.rotation,
+        canvas=Canvas(width=canvas_width, height=canvas_height),
+        grid=Grid(rows=payload.rows, cols=payload.cols),
+        vertices=[Vertex(index=index, x=u, y=v) for index, (u, v) in enumerate(normalized)],
+        path=[CellStep(row=row, col=col) for row, col in cells],
     )
